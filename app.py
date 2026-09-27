@@ -9,7 +9,7 @@ import onnxruntime as ort
 from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoTokenizer
-from huggingface_hub import hf_hub_download
+from huggingface_hub import snapshot_download
 
 # CHANGE THIS to your ONNX model repo
 MODEL_REPO = "Ahmed-AI-Engineer/smartassist-nlp-intent-model-onnx"
@@ -17,11 +17,15 @@ MODEL_REPO = "Ahmed-AI-Engineer/smartassist-nlp-intent-model-onnx"
 print(f"Loading tokenizer and ONNX model from: {MODEL_REPO}")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO)
 
-onnx_path = hf_hub_download(repo_id=MODEL_REPO, filename="model.onnx")
+# Download the full repo snapshot so model.onnx.data (external weights file,
+# if present) is fetched alongside model.onnx — a single hf_hub_download
+# only grabs the one named file and misses this companion file.
+local_dir = snapshot_download(repo_id=MODEL_REPO)
+
+onnx_path = f"{local_dir}/model.onnx"
 session = ort.InferenceSession(onnx_path)
 
-id2label_path = hf_hub_download(repo_id=MODEL_REPO, filename="id2label.json")
-with open(id2label_path, encoding="utf-8") as f:
+with open(f"{local_dir}/id2label.json", encoding="utf-8") as f:
     id2label = {int(k): v for k, v in json.load(f).items()}
 
 print("Model loaded. API ready.")
