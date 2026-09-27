@@ -1,20 +1,29 @@
 """
-FastAPI app for Hugging Face Spaces deployment.
-Loads the fine-tuned model from your HF Hub model repo (not local files),
-so this Space stays lightweight and rebuilds fast.
+Lightweight FastAPI app using raw ONNX Runtime + transformers tokenizer only.
+No PyTorch, no optimum dependency — minimal memory footprint for free-tier hosting.
 """
 
+import json
+import numpy as np
+import onnxruntime as ort
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline
+from transformers import AutoTokenizer
+from huggingface_hub import hf_hub_download
 
-# CHANGE THIS to your actual model repo id (from step 2)
-MODEL_REPO = "Ahmed-AI-Engineer/smartassist-nlp-intent-model"
+# CHANGE THIS to your ONNX model repo
+MODEL_REPO = "Ahmed-AI-Engineer/smartassist-nlp-intent-model-onnx"
 
-print(f"Loading model from Hugging Face Hub: {MODEL_REPO}")
+print(f"Loading tokenizer and ONNX model from: {MODEL_REPO}")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_REPO)
-classifier = TextClassificationPipeline(model=model, tokenizer=tokenizer)
+
+onnx_path = hf_hub_download(repo_id=MODEL_REPO, filename="model.onnx")
+session = ort.InferenceSession(onnx_path)
+
+id2label_path = hf_hub_download(repo_id=MODEL_REPO, filename="id2label.json")
+with open(id2label_path, encoding="utf-8") as f:
+    id2label = {int(k): v for k, v in json.load(f).items()}
+
 print("Model loaded. API ready.")
 
 CONFIDENCE_THRESHOLD = 0.60
@@ -33,16 +42,30 @@ class CommandResponse(BaseModel):
     raw_text: str
 
 
+def softmax(x):
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
+
+
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "SmartAssist NLP API is running on Hugging Face Spaces"}
+    return {"status": "ok", "message": "SmartAssist NLP API (manual ONNX) is running"}
 
 
 @app.post("/predict", response_model=CommandResponse)
 def predict_intent(request: CommandRequest):
-    result = classifier(request.text)[0]
-    intent = result["label"]
-    confidence = float(result["score"])
+    inputs = tokenizer(request.text, return_tensors="np")
+
+    onnx_inputs = {
+        "input_ids": inputs["input_ids"].astype(np.int64),
+        "attention_mask": inputs["attention_mask"].astype(np.int64),
+    }
+    logits = session.run(["logits"], onnx_inputs)[0][0]
+    probs = softmax(logits)
+
+    pred_id = int(np.argmax(probs))
+    intent = id2label[pred_id]
+    confidence = float(probs[pred_id])
 
     return CommandResponse(
         intent=intent,
