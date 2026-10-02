@@ -1,7 +1,6 @@
+gradio
 fastapi
 uvicorn[standard]
-onnxruntime
+torch
 transformers
-huggingface_hub
-numpy
 pydantic

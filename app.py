@@ -1,38 +1,48 @@
 """
-Lightweight FastAPI app using raw ONNX Runtime + transformers tokenizer only.
-No PyTorch, no optimum dependency — minimal memory footprint for free-tier hosting.
+Hugging Face Space (Gradio SDK) that also exposes a clean REST /predict
+endpoint for the Flutter app — same request/response shape as our
+original FastAPI design, so no Flutter-side changes are needed.
 """
 
-import json
-import numpy as np
-import onnxruntime as ort
+import gradio as gr
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import AutoTokenizer
-from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline
 
-# CHANGE THIS to your ONNX model repo
-MODEL_REPO = "Ahmed-AI-Engineer/smartassist-nlp-intent-model-onnx"
+MODEL_REPO = "Ahmed-AI-Engineer/smartassist-nlp-intent-model"
 
-print(f"Loading tokenizer and ONNX model from: {MODEL_REPO}")
+print(f"Loading model from: {MODEL_REPO}")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO)
-
-# Download the full repo snapshot so model.onnx.data (external weights file,
-# if present) is fetched alongside model.onnx — a single hf_hub_download
-# only grabs the one named file and misses this companion file.
-local_dir = snapshot_download(repo_id=MODEL_REPO)
-
-onnx_path = f"{local_dir}/model.onnx"
-session = ort.InferenceSession(onnx_path)
-
-with open(f"{local_dir}/id2label.json", encoding="utf-8") as f:
-    id2label = {int(k): v for k, v in json.load(f).items()}
-
-print("Model loaded. API ready.")
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_REPO)
+classifier = TextClassificationPipeline(model=model, tokenizer=tokenizer)
+print("Model loaded.")
 
 CONFIDENCE_THRESHOLD = 0.60
 
-app = FastAPI(title="SmartAssist NLP API")
+
+def predict_intent(text: str) -> dict:
+    result = classifier(text)[0]
+    confidence = float(result["score"])
+    return {
+        "intent": result["label"],
+        "confidence": confidence,
+        "needs_confirmation": confidence < CONFIDENCE_THRESHOLD,
+        "raw_text": text,
+    }
+
+
+# ---- Simple Gradio UI (satisfies the Space's SDK requirement, also lets
+#      you test manually in the browser at the Space's root URL) ----
+demo = gr.Interface(
+    fn=predict_intent,
+    inputs=gr.Textbox(label="Voice command text (English/Urdu/Roman Urdu)"),
+    outputs=gr.JSON(label="Prediction"),
+    title="SmartAssist NLP API",
+    description="Intent classification for the SmartAssist home automation voice commands.",
+)
+
+# ---- Custom FastAPI app mounted alongside Gradio — this is what Flutter calls ----
+fastapi_app = FastAPI(title="SmartAssist NLP API")
 
 
 class CommandRequest(BaseModel):
@@ -46,34 +56,15 @@ class CommandResponse(BaseModel):
     raw_text: str
 
 
-def softmax(x):
-    e_x = np.exp(x - np.max(x))
-    return e_x / e_x.sum()
-
-
-@app.get("/")
+@fastapi_app.get("/health")
 def health_check():
-    return {"status": "ok", "message": "SmartAssist NLP API (manual ONNX) is running"}
+    return {"status": "ok", "message": "SmartAssist NLP API running on HF Space (Gradio)"}
 
 
-@app.post("/predict", response_model=CommandResponse)
-def predict_intent(request: CommandRequest):
-    inputs = tokenizer(request.text, return_tensors="np")
+@fastapi_app.post("/predict", response_model=CommandResponse)
+def predict_api(request: CommandRequest):
+    return predict_intent(request.text)
 
-    onnx_inputs = {
-        "input_ids": inputs["input_ids"].astype(np.int64),
-        "attention_mask": inputs["attention_mask"].astype(np.int64),
-    }
-    logits = session.run(["logits"], onnx_inputs)[0][0]
-    probs = softmax(logits)
 
-    pred_id = int(np.argmax(probs))
-    intent = id2label[pred_id]
-    confidence = float(probs[pred_id])
-
-    return CommandResponse(
-        intent=intent,
-        confidence=confidence,
-        needs_confirmation=confidence < CONFIDENCE_THRESHOLD,
-        raw_text=request.text,
-    )
+# Mount Gradio UI at "/" and keep our custom FastAPI routes (like /predict) active
+app = gr.mount_gradio_app(fastapi_app, demo, path="/")
